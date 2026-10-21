@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>绘图工具</title>
+<style>
+  :root { --bg:#f4f5f7; --panel:#ffffff; --border:#d0d4da; --accent:#2563eb; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: system-ui, "Segoe UI", "Microsoft YaHei", sans-serif; background:var(--bg); color:#1f2430; }
+  header { padding:10px 14px; background:var(--panel); border-bottom:1px solid var(--border); }
+  header h1 { font-size:16px; margin:0 0 8px; font-weight:600; }
+  .toolbar { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
+  .group { display:flex; gap:4px; align-items:center; padding:4px; background:#eef0f3; border:1px solid var(--border); border-radius:8px; }
+  button { font:inherit; font-size:13px; padding:6px 10px; border:1px solid transparent; background:#fff; border-radius:6px; cursor:pointer; }
+  button:hover { background:#f0f4ff; }
+  button.active { background:var(--accent); color:#fff; }
+  button:disabled { opacity:.4; cursor:not-allowed; }
+  label { font-size:13px; display:flex; align-items:center; gap:6px; }
+  input[type=color] { width:34px; height:28px; border:1px solid var(--border); border-radius:6px; padding:0; background:#fff; }
+  input[type=range] { width:110px; }
+  .size-val { min-width:22px; text-align:right; }
+  .canvas-wrap { padding:16px; display:flex; justify-content:center; }
+  canvas { background:#fff; outline:1px solid var(--border); border-radius:4px; box-shadow:0 1px 4px rgba(0,0,0,.08); touch-action:none; cursor:crosshair; }
+</style>
+</head>
+<body>
+<header>
+  <h1>绘图工具</h1>
+  <div class="toolbar">
+    <div class="group" id="tools">
+      <button data-tool="brush" class="active">画笔</button>
+      <button data-tool="eraser">橡皮擦</button>
+      <button data-tool="line">直线</button>
+      <button data-tool="rect">矩形</button>
+      <button data-tool="ellipse">圆形</button>
+    </div>
+    <div class="group">
+      <label>颜色 <input type="color" id="color" value="#000000"></label>
+      <label>粗细 <input type="range" id="size" min="1" max="40" value="3"><span class="size-val" id="sizeVal">3</span></label>
+    </div>
+    <div class="group">
+      <button id="undo" disabled>撤销</button>
+      <button id="redo" disabled>重做</button>
+      <button id="clear">清空</button>
+      <button id="save">保存 PNG</button>
+    </div>
+  </div>
+</header>
+<div class="canvas-wrap">
+  <canvas id="canvas" width="800" height="600"></canvas>
+</div>
+<script>
+(function () {
+  'use strict';
+
+  /* ============================================================
+   * 可测试的绘图逻辑（暴露为 window.PainterLogic）
+   * ============================================================ */
+  function createHistory(limit) {
+    var cap = (typeof limit === 'number' && limit > 0) ? limit : 30;
+    var stack = [];
+    var index = -1;
+    return {
+      push: function (snapshot) {
+        stack.length = index + 1;
+        stack.push(snapshot);
+        if (stack.length > cap) stack.shift();
+        index = stack.length - 1;
+      },
+      undo: function () {
+        if (index > 0) index--;
+        return stack[index];
+      },
+      redo: function () {
+        if (index < stack.length - 1) index++;
+        return stack[index];
+      },
+      canUndo: function () { return index > 0; },
+      canRedo: function () { return index < stack.length - 1; },
+      clear: function () { stack.length = 0; index = -1; },
+      current: function () { return stack[index]; }
+    };
+  }
+
+  function normalizeRect(start, end) {
+    return {
+      x: Math.min(start.x, end.x),
+      y: Math.min(start.y, end.y),
+      w: Math.abs(end.x - start.x),
+      h: Math.abs(end.y - start.y)
+    };
+  }
+
+  function ellipseParams(start, end) {
+    return {
+      cx: (start.x + end.x) / 2,
+      cy: (start.y + end.y) / 2,
+      rx: Math.abs(end.x - start.x) / 2,
+      ry: Math.abs(end.y - start.y) / 2
+    };
+  }
+
+  function constrainShape(start, end, tool, shift) {
+    if (!shift) return { x: end.x, y: end.y };
+    if (tool !== 'rect' && tool !== 'ellipse') return { x: end.x, y: end.y };
+    var dx = end.x - start.x;
+    var dy = end.y - start.y;
+    var side = Math.max(Math.abs(dx), Math.abs(dy));
+    var sx = dx < 0 ? -1 : 1;
+    var sy = dy < 0 ? -1 : 1;
+    return { x: start.x + side * sx, y: start.y + side * sy };
+  }
+
+  function drawStroke(ctx, points, style) {
+    if (!points || points.length === 0) return;
+    ctx.save();
+    ctx.strokeStyle = style.color;
+    ctx.lineWidth = style.size;
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    ctx.beginPath();
+    if (points.length === 1) {
+      ctx.moveTo(points[0].x, points[0].y);
+      ctx.lineTo(points[0].x + 0.01, points[0].y + 0.01);
+    } else {
+      ctx.moveTo(points[0].x, points[0].y);
+      for (var i = 1; i < points.length; i++) ctx.lineTo(points[i].x, points[i].y);
+    }
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  function drawShape(ctx, tool, start, end, style) {
+    ctx.save();
+    ctx.strokeStyle = style.color;
+    ctx.lineWidth = style.size;
+    ctx.lineJoin = 'round';
+    ctx.beginPath();
+    if (tool === 'line') {
+      ctx.moveTo(start.x, start.y);
+      ctx.lineTo(end.x, end.y);
+    } else if (tool === 'rect') {
+      var r = normalizeRect(start, end);
+      ctx.rect(r.x, r.y, r.w, r.h);
+    } else if (tool === 'ellipse') {
+      var ep = ellipseParams(start, end);
+      ctx.ellipse(ep.cx, ep.cy, ep.rx, ep.ry, 0, 0, Math.PI * 2);
+    }
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  window.PainterLogic = {
+    createHistory: createHistory,
+    normalizeRect: normalizeRect,
+    ellipseParams: ellipseParams,
+    constrainShape: constrainShape,
+    drawStroke: drawStroke,
+    drawShape: drawShape
+  };
+
+  /* ============================================================
+   * 页面接线（依赖真实 DOM / Canvas）
+   * ============================================================ */
+  var canvas = document.getElementById('canvas');
+  var ctx = canvas.getContext('2d', { willReadFrequently: true });
+  var L = window.PainterLogic;
+
+  var state = { tool: 'brush', color: '#000000', size: 3 };
+  var history = L.createHistory(30);
+  var drawing = false;
+  var lastPoint = null;
+  var dragStart = null;
+  var dragSnapshot = null;
+
+  function blank() {
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+  }
+
+  function snapshot() {
+    return canvas.toDataURL('image/png');
+  }
+
+  function restore(dataUrl) {
+    if (!dataUrl) { blank(); return; }
+    var img = new Image();
+    img.onload = function () {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.drawImage(img, 0, 0);
+    };
+    img.src = dataUrl;
+  }
+
+  function updateButtons() {
+    document.getElementById('undo').disabled = !history.canUndo();
+    document.getElementById('redo').disabled = !history.canRedo();
+  }
+
+  function pushHistory() {
+    history.push(snapshot());
+    updateButtons();
+  }
+
+  function getPos(e) {
+    var rect = canvas.getBoundingClientRect();
+    return {
+      x: (e.clientX - rect.left) * (canvas.width / rect.width),
+      y: (e.clientY - rect.top) * (canvas.height / rect.height)
+    };
+  }
+
+  function strokeStyle() {
+    var eraser = state.tool === 'eraser';
+    return { color: eraser ? '#ffffff' : state.color, size: eraser ? state.size * 2 : state.size };
+  }
+
+  function onDown(e) {
+    e.preventDefault();
+    canvas.setPointerCapture(e.pointerId);
+    var p = getPos(e);
+    drawing = true;
+    if (state.tool === 'line' || state.tool === 'rect' || state.tool === 'ellipse') {
+      dragStart = p;
+      dragSnapshot = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    } else {
+      lastPoint = p;
+      L.drawStroke(ctx, [p], strokeStyle());
+    }
+  }
+
+  function onMove(e) {
+    if (!drawing) return;
+    var p = getPos(e);
+    if (dragStart) {
+      ctx.putImageData(dragSnapshot, 0, 0);
+      var previewEnd = L.constrainShape(dragStart, p, state.tool, e.shiftKey);
+      L.drawShape(ctx, state.tool, dragStart, previewEnd, { color: state.color, size: state.size });
+    } else if (lastPoint) {
+      L.drawStroke(ctx, [lastPoint, p], strokeStyle());
+      lastPoint = p;
+    }
+  }
+
+  function onUp(e) {
+    if (!drawing) return;
+    drawing = false;
+    if (dragStart) {
+      var p = getPos(e);
+      ctx.putImageData(dragSnapshot, 0, 0);
+      var finalEnd = L.constrainShape(dragStart, p, state.tool, e.shiftKey);
+      L.drawShape(ctx, state.tool, dragStart, finalEnd, { color: state.color, size: state.size });
+      dragStart = null;
+      dragSnapshot = null;
+    }
+    lastPoint = null;
+    pushHistory();
+  }
+
+  canvas.addEventListener('pointerdown', onDown);
+  canvas.addEventListener('pointermove', onMove);
+  canvas.addEventListener('pointerup', onUp);
+  canvas.addEventListener('pointercancel', onUp);
+
+  var toolButtons = document.querySelectorAll('#tools button');
+  toolButtons.forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      state.tool = btn.getAttribute('data-tool');
+      toolButtons.forEach(function (b) { b.classList.toggle('active', b === btn); });
+    });
+  });
+
+  document.getElementById('color').addEventListener('input', function (e) { state.color = e.target.value; });
+
+  var sizeInput = document.getElementById('size');
+  sizeInput.addEventListener('input', function (e) {
+    state.size = parseInt(e.target.value, 10);
+    document.getElementById('sizeVal').textContent = e.target.value;
+  });
+
+  document.getElementById('undo').addEventListener('click', function () { restore(history.undo()); updateButtons(); });
+  document.getElementById('redo').addEventListener('click', function () { restore(history.redo()); updateButtons(); });
+  document.getElementById('clear').addEventListener('click', function () { blank(); pushHistory(); });
+  document.getElementById('save').addEventListener('click', function () {
+    var a = document.createElement('a');
+    a.download = 'painting.png';
+    a.href = canvas.toDataURL('image/png');
+    a.click();
+  });
+
+  blank();
+  pushHistory();
+})();
+</script>
+</body>
+</html>
